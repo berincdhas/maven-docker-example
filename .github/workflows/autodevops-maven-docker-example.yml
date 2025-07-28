@@ -72,8 +72,17 @@ jobs:
       - name: Dependency installation (Maven)
         run: mvn --batch-mode dependency:resolve
 
+      - name: Check for Makefile and deps target
+        id: check_makefile_deps
+        run: |
+          if [ -f Makefile ] && grep -qE '^[^#]*\bdeps\b *:' Makefile; then
+            echo "has_make_deps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_make_deps=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Dependency installation (Make)
-        if: ${{ hashFiles('Makefile') != '' }}
+        if: steps.check_makefile_deps.outputs.has_make_deps == 'true'
         run: make deps
 
       - name: Static code analysis - SonarQube
@@ -250,7 +259,6 @@ jobs:
 
       - name: Validate Azure policy/compliance
         run: |
-          # Example for Azure Policy evaluation
           az policy state list --resource-group ${{ env.RESOURCE_GROUP }} --query "[?complianceState=='NonCompliant']"
         continue-on-error: true
 
