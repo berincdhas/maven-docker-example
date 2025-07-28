@@ -1,370 +1,225 @@
 name: autodevops-maven-docker-example
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - master
+      - main
   pull_request:
     branches:
       - master
-  workflow_dispatch:
-    inputs:
-      registry:
-        description: "Container registry URL"
-        required: true
-        default: autodevopsacr.azurecr.io
-      app_namespace:
-        description: "Kubernetes application namespace"
-        required: true
-        default: argo
-      resourceGroup:
-        description: "Azure resource group"
-        required: true
-        default: sda-auto-devops-demo
+      - main
+
+concurrency:
+  group: autodevops-maven-docker-example-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  JAVA_VERSION: 17
+  MAVEN_OPTS: -Dmaven.repo.local=.m2/repository
+  SONAR_PROJECT_KEY: ${{ github.repository }}
+  SONAR_ORGANIZATION: ""
+  SONAR_HOST_URL: "https://sonarcloud.io"
 
 permissions:
   contents: read
-  id-token: write
-  actions: read
-
-concurrency:
-  group: pr-${{ github.ref }}
-  cancel-in-progress: true
+  packages: write
 
 jobs:
 
-  precheck:
-    name: Repository Pre-Check
+  pre-check:
+    name: "Repository Pre-Check"
     runs-on: ubuntu-latest
-    timeout-minutes: 3
     outputs:
-      pom_exists: ${{ steps.pom_check.outputs.found }}
-      sonar_token_exists: ${{ steps.sonar_token_check.outputs.has_token }}
+      has_pom: ${{ steps.check_pom.outputs.found }}
+      has_sonar_token: ${{ steps.check_sonar.outputs.has_sonar_token }}
+    timeout-minutes: 3
     steps:
-      - name: Check for pom.xml
-        id: pom_check
+      - name: 'Check for pom.xml'
+        id: check_pom
         run: |
-          if [ -f ./pom.xml ]; then
+          if [ -f pom.xml ]; then
             echo "found=true" >> $GITHUB_OUTPUT
           else
             echo "found=false" >> $GITHUB_OUTPUT
           fi
-      - name: Check for SONAR_TOKEN Secret
-        id: sonar_token_check
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: 'Check for SONAR_TOKEN Secret'
+        id: check_sonar
         run: |
-          if [ -n "$SONAR_TOKEN" ]; then
-            echo "has_token=true" >> $GITHUB_OUTPUT
+          if [ -z "${{ secrets.SONAR_TOKEN }}" ]; then
+            echo "has_sonar_token=false" >> $GITHUB_OUTPUT
           else
-            echo "has_token=false" >> $GITHUB_OUTPUT
+            echo "has_sonar_token=true" >> $GITHUB_OUTPUT
           fi
 
-  checkout_code:
-    name: Checkout Code
+  guard-pom-not-found:
+    name: "pom.xml Not Found Guard"
+    needs: pre-check
+    if: needs.pre-check.outputs.has_pom == 'false'
     runs-on: ubuntu-latest
-    needs: precheck
+    timeout-minutes: 2
+    steps:
+      - name: 'Fail Build - pom.xml Missing'
+        run: |
+          echo "Workflow terminated: pom.xml file not found in root of repository. Please add pom.xml to proceed."
+          exit 1
+
+  checkout:
+    name: "Checkout Code"
+    needs: pre-check
+    if: needs.pre-check.outputs.has_pom == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+  set-up-java:
+    name: "Set Up Java"
+    needs: checkout
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout Source
-        uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
-          fetch-depth: 0
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
 
-  static_analysis:
-    name: Static Analysis and Linting
+  cache-maven:
+    name: "Cache Maven Repo"
+    needs: set-up-java
     runs-on: ubuntu-latest
-    needs: [checkout_code, precheck]
-    timeout-minutes: 10
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-      - name: SonarQube Scan
-        if: needs.precheck.outputs.sonar_token_exists == 'true'
-        uses: sonarsource/sonarqube-scan-action@v2.0.2
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          projectBaseDir: .
-        continue-on-error: true
-      - name: Skip SonarQube (No Token)
-        if: needs.precheck.outputs.sonar_token_exists != 'true'
-        run: |
-          echo "Skipping SonarQube scan due to missing SONAR_TOKEN secret."
-
-  dependency_management:
-    name: Dependency Management
-    runs-on: ubuntu-latest
-    needs: [checkout_code, precheck]
     timeout-minutes: 5
-    if: needs.precheck.outputs.pom_exists == 'true'
     steps:
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - uses: actions/cache@v4
         with:
-          distribution: temurin
-          java-version: 17
-      - name: Restore Maven Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-      - name: Retry Maven Dependency Resolve
-        uses: nick-invision/retry@v2.9.0
-        with:
-          max_attempts: 3
-          timeout_minutes: 3
-          command: mvn dependency:resolve
-      - name: Fallback on Maven Failure
-        if: failure()
-        run: |
-          echo "Maven dependency resolution failed after retries. Check pom.xml and repository access." && exit 1
-
-  pom_missing_guard:
-    name: pom.xml Not Found Guard
-    runs-on: ubuntu-latest
-    needs: precheck
-    if: needs.precheck.outputs.pom_exists != 'true'
-    steps:
-      - name: Fail Build - pom.xml Missing
-        run: |
-          echo "Workflow terminated: pom.xml file not found in root of repository. Please add pom.xml to proceed." && exit 1
+          path: .m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven
 
   build:
-    name: Build Application
+    name: "Build with Maven"
+    needs: cache-maven
     runs-on: ubuntu-latest
-    needs: [dependency_management, static_analysis, pom_missing_guard]
-    timeout-minutes: 15
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-      - name: Build with Maven
-        run: mvn clean compile
-      - name: Run custom Make build (if needed)
-        run: make build || echo "No Makefile build step"
-
-  unit_integration_tests:
-    name: Unit and Integration Tests
-    runs-on: ubuntu-latest
-    needs: build
-    timeout-minutes: 15
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-      - name: Run Tests
-        run: mvn test
-
-  security_scanning:
-    name: Security Scanning
-    runs-on: ubuntu-latest
-    needs: unit_integration_tests
     timeout-minutes: 10
-    if: needs.precheck.outputs.pom_exists == 'true'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: SonarQube Scan (Security)
-        if: needs.precheck.outputs.sonar_token_exists == 'true'
-        uses: sonarsource/sonarqube-scan-action@v2.0.2
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: .m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven
+      - name: Build with Maven
+        run: mvn -B package --file pom.xml
+
+  test:
+    name: "Test"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: .m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven
+      - name: Run tests with Maven
+        run: mvn -B test --file pom.xml
+
+  code-analysis:
+    name: "SonarCloud Code Analysis"
+    needs: test
+    if: needs.pre-check.outputs.has_sonar_token == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: .m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven
+      - name: SonarCloud Scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          projectBaseDir: .
-        continue-on-error: true
-      - name: Skip SonarQube (No Token)
-        if: needs.precheck.outputs.sonar_token_exists != 'true'
-        run: echo "Skipping SonarQube security scan due to missing SONAR_TOKEN."
-      - name: Install Trivy
-        uses: aquasecurity/trivy-action@v0.22.0
-      - name: Trivy Scan File System
-        run: trivy fs --exit-code 1 --no-progress .
-        continue-on-error: true
+        run: |
+          mvn -B verify sonar:sonar \
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }} \
+            -Dsonar.organization=${{ env.SONAR_ORGANIZATION }} \
+            -Dsonar.host.url=${{ env.SONAR_HOST_URL }} \
+            -Dsonar.login=$SONAR_TOKEN
 
-  package_artifacts:
-    name: Package Artifacts
+  docker-build:
+    name: "Docker Build"
+    needs: test
     runs-on: ubuntu-latest
-    needs: security_scanning
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  deploy-dev:
+    name: "Deploy to Dev"
+    needs: docker-build
+    runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: needs.precheck.outputs.pom_exists == 'true'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-      - name: Package JAR/WAR
-        run: mvn package
+      - name: Dummy Deploy Dev
+        run: echo "Pretend to deploy to Dev environment"
 
-  build_docker:
-    name: Build Docker Image
+  deploy-staging:
+    name: "Deploy to Staging"
+    needs: deploy-dev
     runs-on: ubuntu-latest
-    needs: package_artifacts
-    timeout-minutes: 10
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Login to Azure Container Registry
-        uses: azure/docker-login@v1
-        with:
-          login-server: ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
-          username: ${{ secrets.AZURE_ACR_USERNAME }}
-          password: ${{ secrets.AZURE_ACR_PASSWORD }}
-      - name: Build Docker Image
-        run: |
-          IMAGE_TAG=${{ github.sha }}
-          docker build -t ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}/maven-docker-example:$IMAGE_TAG .
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-
-  docker_image_scanning:
-    name: Container Image Scanning
-    runs-on: ubuntu-latest
-    needs: build_docker
     timeout-minutes: 5
-    if: needs.precheck.outputs.pom_exists == 'true'
     steps:
-      - name: Install Trivy
-        uses: aquasecurity/trivy-action@v0.22.0
-      - name: Trivy Scan Docker Image
-        run: |
-          IMAGE_TAG=${{ github.sha }}
-          trivy image --exit-code 1 --no-progress ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}/maven-docker-example:$IMAGE_TAG
-        continue-on-error: true
+      - name: Dummy Deploy Staging
+        run: echo "Pretend to deploy to Staging environment"
 
-  push_docker_artifacts:
-    name: Push Docker Image
+  deploy-prod:
+    name: "Deploy to Prod"
+    needs: deploy-staging
     runs-on: ubuntu-latest
-    needs: docker_image_scanning
-    timeout-minutes: 10
-    if: needs.precheck.outputs.pom_exists == 'true'
+    timeout-minutes: 5
     steps:
-      - name: Login to Azure Container Registry
-        uses: azure/docker-login@v1
-        with:
-          login-server: ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
-          username: ${{ secrets.AZURE_ACR_USERNAME }}
-          password: ${{ secrets.AZURE_ACR_PASSWORD }}
-      - name: Push Docker Image
-        run: |
-          IMAGE_TAG=${{ github.sha }}
-          docker push ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}/maven-docker-example:$IMAGE_TAG
-
-  push_java_artifacts:
-    name: Push Java Artifacts
-    runs-on: ubuntu-latest
-    needs: package_artifacts
-    timeout-minutes: 10
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-      - name: Publish Artifact to Azure Artifacts/Nexus
-        env:
-          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
-          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
-        run: |
-          mvn deploy || echo "Deployment to Maven/Nexus skipped if not configured"
-
-  infra_provision:
-    name: Infrastructure Provisioning
-    runs-on: ubuntu-latest
-    needs: push_docker_artifacts
-    timeout-minutes: 20
-    environment: production
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3.0.0
-      - name: Terraform Init
-        run: terraform init
-      - name: Terraform Validate
-        run: terraform validate
-      - name: Terraform Plan
-        run: terraform plan
-      - name: Terraform Apply (Auto-approved)
-        run: terraform apply -auto-approve
-
-  deploy_aks:
-    name: Deploy to Azure Kubernetes Service (AKS)
-    runs-on: ubuntu-latest
-    needs: infra_provision
-    timeout-minutes: 20
-    environment: production
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Set up Azure CLI
-        uses: azure/cli@v2.0.0
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - name: Get AKS Credentials
-        run: az aks get-credentials --resource-group ${{ inputs.resourceGroup || github.event.inputs.resourceGroup || 'sda-auto-devops-demo' }} --name aks-cluster --overwrite-existing
-      - name: Deploy App Manifests
-        run: |
-          kubectl apply -n ${{ inputs.app_namespace || github.event.inputs.app_namespace || 'argo' }} -f k8s/
-      - name: Verify Pod Status
-        run: |
-          kubectl -n ${{ inputs.app_namespace || github.event.inputs.app_namespace || 'argo' }} rollout status deployment/maven-docker-example
-
-  post_deploy_testing:
-    name: Post-Deployment Testing & Smoke Tests
-    runs-on: ubuntu-latest
-    needs: deploy_aks
-    timeout-minutes: 10
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Run Smoke Tests
-        run: |
-          kubectl -n ${{ inputs.app_namespace || github.event.inputs.app_namespace || 'argo' }} get pods
-          # Place smoke test scripts here
-
-  monitoring_alerting:
-    name: Monitoring & Alerting Setup
-    runs-on: ubuntu-latest
-    needs: post_deploy_testing
-    timeout-minutes: 10
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Setup Prometheus
-        run: echo "Ensure Prometheus is configured in cluster"
-      - name: Setup Azure Monitor
-        run: echo "Ensure Azure Monitor is configured for AKS cluster"
-
-  compliance_audit:
-    name: Compliance Audit & Reporting
-    runs-on: ubuntu-latest
-    needs: monitoring_alerting
-    timeout-minutes: 10
-    if: needs.precheck.outputs.pom_exists == 'true'
-    steps:
-      - name: Run Azure Policy Compliance Scan
-        run: echo "Run Azure Policy script for compliance"
-      - name: Generate Compliance Reports
-        run: echo "Generate and archive HIPAA/AKS/internal compliance report"
+      - name: Dummy Deploy Prod
+        run: echo "Pretend to deploy to Production environment"
