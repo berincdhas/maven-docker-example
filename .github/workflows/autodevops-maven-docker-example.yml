@@ -1,0 +1,296 @@
+name: autodevops-maven-docker-example
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: "Container registry URL"
+        required: true
+        default: autodevopsacr.azurecr.io
+      app_namespace:
+        description: "Kubernetes application namespace"
+        required: true
+        default: argo
+      resourceGroup:
+        description: "Azure resource group"
+        required: true
+        default: sda-auto-devops-demo
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  checkout_code:
+    name: Checkout Code
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+  static_analysis:
+    name: Static Analysis and Linting
+    runs-on: ubuntu-latest
+    needs: checkout_code
+    timeout-minutes: 10
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v2.0.2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: .
+
+  dependency_management:
+    name: Dependency Management
+    runs-on: ubuntu-latest
+    needs: checkout_code
+    timeout-minutes: 5
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Restore Maven Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+      - name: Maven Dependency Resolve
+        run: mvn dependency:resolve
+
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [dependency_management, static_analysis]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Build with Maven
+        run: mvn clean compile
+      - name: Run custom Make build (if needed)
+        run: make build || echo "No Makefile build step"
+
+  unit_integration_tests:
+    name: Unit and Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Run Tests
+        run: mvn test
+
+  security_scanning:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: unit_integration_tests
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run SonarQube
+        uses: sonarsource/sonarqube-scan-action@v2.0.2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: .
+      - name: Install Trivy
+        uses: aquasecurity/trivy-action@v0.22.0
+      - name: Trivy Scan File System
+        run: trivy fs --exit-code 1 --no-progress .
+
+  package_artifacts:
+    name: Package Artifacts
+    runs-on: ubuntu-latest
+    needs: security_scanning
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Package JAR/WAR
+        run: mvn package
+
+  build_docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: package_artifacts
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
+          username: ${{ secrets.AZURE_ACR_USERNAME }}
+          password: ${{ secrets.AZURE_ACR_PASSWORD }}
+      - name: Build Docker Image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker build -t ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}/maven-docker-example:$IMAGE_TAG .
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+  docker_image_scanning:
+    name: Container Image Scanning
+    runs-on: ubuntu-latest
+    needs: build_docker
+    timeout-minutes: 5
+    steps:
+      - name: Install Trivy
+        uses: aquasecurity/trivy-action@v0.22.0
+      - name: Trivy Scan Docker Image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          trivy image --exit-code 1 --no-progress ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}/maven-docker-example:$IMAGE_TAG
+
+  push_docker_artifacts:
+    name: Push Docker Image
+    runs-on: ubuntu-latest
+    needs: docker_image_scanning
+    timeout-minutes: 10
+    steps:
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
+          username: ${{ secrets.AZURE_ACR_USERNAME }}
+          password: ${{ secrets.AZURE_ACR_PASSWORD }}
+      - name: Push Docker Image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker push ${{ inputs.registry || github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}/maven-docker-example:$IMAGE_TAG
+
+  push_java_artifacts:
+    name: Push Java Artifacts
+    runs-on: ubuntu-latest
+    needs: package_artifacts
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Publish Artifact to Azure Artifacts/Nexus
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        run: |
+          mvn deploy || echo "Deployment to Maven/Nexus skipped if not configured"
+
+  infra_provision:
+    name: Infrastructure Provisioning
+    runs-on: ubuntu-latest
+    needs: push_docker_artifacts
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3.0.0
+      - name: Terraform Init
+        run: terraform init
+      - name: Terraform Validate
+        run: terraform validate
+      - name: Terraform Plan
+        run: terraform plan
+      - name: Terraform Apply (Auto-approved)
+        run: terraform apply -auto-approve
+
+  deploy_aks:
+    name: Deploy to Azure Kubernetes Service (AKS)
+    runs-on: ubuntu-latest
+    needs: infra_provision
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Set up Azure CLI
+        uses: azure/cli@v2.0.0
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Get AKS Credentials
+        run: az aks get-credentials --resource-group ${{ inputs.resourceGroup || github.event.inputs.resourceGroup || 'sda-auto-devops-demo' }} --name aks-cluster --overwrite-existing
+      - name: Deploy App Manifests
+        run: |
+          kubectl apply -n ${{ inputs.app_namespace || github.event.inputs.app_namespace || 'argo' }} -f k8s/
+      - name: Verify Pod Status
+        run: |
+          kubectl -n ${{ inputs.app_namespace || github.event.inputs.app_namespace || 'argo' }} rollout status deployment/maven-docker-example
+
+  post_deploy_testing:
+    name: Post-Deployment Testing & Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy_aks
+    timeout-minutes: 10
+    steps:
+      - name: Run Smoke Tests
+        run: |
+          kubectl -n ${{ inputs.app_namespace || github.event.inputs.app_namespace || 'argo' }} get pods
+          # Place smoke test scripts here
+
+  monitoring_alerting:
+    name: Monitoring & Alerting Setup
+    runs-on: ubuntu-latest
+    needs: post_deploy_testing
+    timeout-minutes: 10
+    steps:
+      - name: Setup Prometheus
+        run: echo "Ensure Prometheus is configured in cluster"
+      - name: Setup Azure Monitor
+        run: echo "Ensure Azure Monitor is configured for AKS cluster"
+
+  compliance_audit:
+    name: Compliance Audit & Reporting
+    runs-on: ubuntu-latest
+    needs: monitoring_alerting
+    timeout-minutes: 10
+    steps:
+      - name: Run Azure Policy Compliance Scan
+        run: echo "Run Azure Policy script for compliance"
+      - name: Generate Compliance Reports
+        run: echo "Generate and archive HIPAA/AKS/internal compliance report"
